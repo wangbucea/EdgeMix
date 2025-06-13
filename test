@@ -1,0 +1,612 @@
+import cv2 as cv
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, datasets, models
+from torch.utils.data import Dataset, DataLoader, Subset
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image
+import itertools
+import time
+import json
+from datetime import datetime
+import os
+from sklearn.model_selection import ParameterGrid
+import warnings
+warnings.filterwarnings('ignore')
+
+# 导入原始的MyCompose类
+class MyCompose(object):
+    def __init__(self, pro, N, grids, arr_ksize=None, detect_method_probs=None):
+        """
+        :param pro: 变换概率
+        :param N: 分为N*N的栅格
+        :param grids: 选择多少个栅格
+        :param arr_ksize: 卷积核大小列表
+        :param detect_method_probs: 检测方法概率分布
+        """
+        self.pro = pro
+        self.N = N
+        self.grids = grids
+        self.Flag = False
+        
+        # 可配置的超参数
+        self.arr_ksize = arr_ksize if arr_ksize is not None else [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+        self.detect_method_probs = detect_method_probs if detect_method_probs is not None else [0.3, 0.01, 0.3, 0.01, 0.3, 0.04, 0.04]
+        
+    def changeImage(self, oring_img, edge_img):
+        # 计算网格尺寸
+        N = self.N  # 栅格的行列数
+        height, width = oring_img.shape[:2]
+        grid_width = width // N
+        grid_height = height // N
+
+        # 创建网格列表
+        grids = [(i * grid_width, j * grid_height, (i + 1) * grid_width, (j + 1) * grid_height) for i in range(N) for j in range(N)]
+
+        # 预先决定变换参数
+        should_transform = np.random.rand() < 0.2
+        if should_transform:
+            angle = np.random.uniform(0, 360)
+            flip_code = np.random.choice([-1, 0, 1])
+        else:
+            angle = None
+            flip_code = None
+
+        def random_transform(image, target_height, target_width, angle, flip_code):
+            """对图像进行指定的旋转、翻折，并调整尺寸以匹配目标尺寸"""
+            if angle is not None:
+                image_center = (image.shape[1] / 2, image.shape[0] / 2)
+                rotation_mat = cv.getRotationMatrix2D(image_center, angle, 1.0)
+                abs_cos = abs(rotation_mat[0, 0])
+                abs_sin = abs(rotation_mat[0, 1])
+                bound_w = int(image.shape[0] * abs_sin + image.shape[1] * abs_cos)
+                bound_h = int(image.shape[0] * abs_cos + image.shape[1] * abs_sin)
+                rotation_mat[0, 2] += bound_w / 2 - image_center[0]
+                rotation_mat[1, 2] += bound_h / 2 - image_center[1]
+                image = cv.warpAffine(image, rotation_mat, (bound_w, bound_h))
+                image = cv.flip(image, flip_code)
+            resized_image = cv.resize(image, (target_width, target_height))
+            return resized_image
+
+        result_img = oring_img.copy()
+        num_selected_grids = min(self.grids, len(grids))  # 确保不超过总网格数
+        if num_selected_grids > 0:
+            selected_indices = np.random.choice(len(grids), num_selected_grids, replace=False)
+
+            for index in selected_indices:
+                x1, y1, x2, y2 = grids[index]
+                if x2 > x1 and y2 > y1:  # 确保有效的区域
+                    original_rect = result_img[y1:y2, x1:x2]
+                    edge_rect = edge_img[y1:y2, x1:x2]
+
+                    transformed_original_rect = random_transform(original_rect, y2 - y1, x2 - x1, angle, flip_code)
+                    transformed_edge_rect = random_transform(edge_rect, y2 - y1, x2 - x1, angle, flip_code)
+
+                    rand_weight = np.random.uniform(0.01, 0.99)
+                    if self.Flag:
+                        blended_rect = cv.addWeighted(transformed_edge_rect, 1 - rand_weight, transformed_original_rect, rand_weight, 1, dtype=cv.CV_32F)
+                    else:
+                        blended_rect = cv.addWeighted(transformed_edge_rect, rand_weight, transformed_original_rect, 1 - rand_weight, 1, dtype=cv.CV_32F)
+                    result_img[y1:y2, x1:x2] = blended_rect
+
+        return result_img
+
+    def __call__(self, img):
+        self.p = np.random.rand()
+        img_ = np.array(img).astype('uint8')  # 转image到ndarray形式
+        if self.p > self.pro:
+            random_scale = np.random.uniform(1, 50)
+            random_weight = np.random.rand()
+
+            # 生成 Beta 分布的随机数
+            weights = np.random.beta(0.4, 4, len(self.arr_ksize))
+            weights /= weights.sum()
+            rand_ksize = np.random.choice(self.arr_ksize, size=1, p=weights)
+
+            arr_func = ['Laplac_img', 'Laplac_img2', 'Sobel', 'Sobel2', 'Roberts', 'segmented_image_color', 'canny']
+            alpha_img = np.random.choice(arr_func, 1, p=self.detect_method_probs)
+
+            if alpha_img == 'Laplac_img':
+                Laplac_img = cv.Laplacian(img_, -1, ksize=rand_ksize[0], scale=random_scale)
+                alpha_img = Laplac_img.astype('uint8')
+                mix_img = self.changeImage(img_, alpha_img)
+                pil_img = Image.fromarray(mix_img.astype('uint8')).convert('RGB')  # 转为pil
+                return pil_img
+            elif alpha_img == 'Laplac_img2':
+                Laplac_img = cv.Laplacian(img_, -1, ksize=rand_ksize[0], scale=random_scale)
+                Laplac_img2 = cv.Laplacian(Laplac_img, -1, ksize=rand_ksize[0], scale=random_scale)
+                alpha_img = Laplac_img2.astype('uint8')
+                mix_img = self.changeImage(img_, alpha_img)
+                pil_img = Image.fromarray(mix_img.astype('uint8')).convert('RGB')  # 转为pil
+                return pil_img
+            elif alpha_img == 'Sobel':
+                # sobel
+                x = cv.Sobel(img_, cv.CV_32F, 1, 0, ksize=rand_ksize[0])
+                y = cv.Sobel(img_, cv.CV_32F, 0, 1, ksize=rand_ksize[0])
+                # 转 uint8 ,图像融合
+                Sobel = cv.addWeighted(x, 1 - random_weight, y, random_weight, 1)
+                alpha_img = Sobel.astype('uint8')
+                mix_img = self.changeImage(img_, alpha_img)
+                pil_img = Image.fromarray(mix_img.astype('uint8')).convert('RGB')  # 转为pil
+                return pil_img
+            elif alpha_img == 'Sobel2':
+                # sobel
+                x = cv.Sobel(img_, cv.CV_32F, 1, 0, ksize=rand_ksize[0])
+                y = cv.Sobel(img_, cv.CV_32F, 0, 1, ksize=rand_ksize[0])
+                # 转 uint8 ,图像融合
+                Sobel = cv.addWeighted(x, 1 - random_weight, y, random_weight, 1)
+                x2 = cv.Sobel(Sobel, cv.CV_32F, 1, 0, ksize=rand_ksize[0])
+                y2 = cv.Sobel(Sobel, cv.CV_32F, 0, 1, ksize=rand_ksize[0])
+                # 转 uint8 ,图像融合
+                Sobel2 = cv.addWeighted(x2, random_weight, y2, 1 - random_weight, 1)
+                alpha_img = Sobel2.astype('uint8')
+                mix_img = self.changeImage(img_, alpha_img)
+                pil_img = Image.fromarray(mix_img.astype('uint8')).convert('RGB')  # 转为pil
+                return pil_img
+            elif alpha_img == 'Roberts':
+                # Roberts算子
+                kernelx = np.array([[-1, 0], [0, 1]], dtype=int)
+                kernely = np.array([[0, -1], [1, 0]], dtype=int)
+                x = cv.filter2D(img_, cv.CV_32F, kernelx)
+                y = cv.filter2D(img_, cv.CV_32F, kernely)
+                # 转uint8
+                Roberts = cv.addWeighted(x, random_weight, y, 1 - random_weight, 10)
+                alpha_img = Roberts.astype('uint8')
+                mix_img = self.changeImage(img_, alpha_img)
+                pil_img = Image.fromarray(mix_img.astype('uint8')).convert('RGB')  # 转为pil
+                return pil_img
+            elif alpha_img == 'segmented_image_color':
+                gray_image = cv.cvtColor(img_, cv.COLOR_BGR2GRAY)
+                gray_image = gray_image.astype(np.uint8)
+                _, binary_image = cv.threshold(gray_image, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+                # 将二值化图像转换为三通道的灰度图像
+                segmented_image_gray = cv.cvtColor(binary_image, cv.COLOR_GRAY2BGR)
+                # 将灰度图像转换为彩色图像
+                segmented_image_color = cv.cvtColor(segmented_image_gray, cv.COLOR_BGR2RGB)
+                alpha_img = segmented_image_color.astype('uint8')
+                mix_img = self.changeImage(img_, alpha_img)
+                pil_img = Image.fromarray(mix_img.astype('uint8')).convert('RGB')  # 转为pil
+                return pil_img
+            elif alpha_img == 'canny':
+                gray_image = cv.cvtColor(img_, cv.COLOR_BGR2GRAY)
+                gray_image = gray_image.astype(np.uint8)
+                # 边缘检测分割
+                edges = cv.Canny(gray_image, 50, 100)
+                # 根据边缘信息进行图像分割
+                segmented_image = np.zeros_like(gray_image)
+                segmented_image[edges > 0] = 255
+                # 将分割后的灰度图像转换为三通道彩色图像
+                color_segmented_image = cv.cvtColor(segmented_image, cv.COLOR_GRAY2BGR)
+                alpha_img = color_segmented_image.astype('uint8')
+                mix_img = self.changeImage(img_, alpha_img)
+                pil_img = Image.fromarray(mix_img.astype('uint8')).convert('RGB')  # 转为pil
+                return pil_img
+        else:
+            return img
+
+class HyperparameterSearcher:
+    def __init__(self, data_root, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.device = device
+        self.data_root = data_root
+        self.results = []
+        
+        # 创建结果保存目录
+        self.save_dir = 'hyperparameter_search_results'
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+        print(f"使用设备: {self.device}")
+        
+    def create_model(self):
+        """创建预训练的ResNet18模型"""
+        model = models.resnet18(pretrained=True)
+        # 修改最后一层以适应CIFAR-100的100个类别
+        model.fc = nn.Linear(model.fc.in_features, 100)
+        return model.to(self.device)
+    
+    def create_dataloader(self, N, grids, arr_ksize, detect_method_probs, batch_size=64, subset_ratio=0.5):
+        """创建数据加载器"""
+        # 训练时的变换
+        transform_train = transforms.Compose([
+            MyCompose(0.85, N=N, grids=grids, arr_ksize=arr_ksize, detect_method_probs=detect_method_probs),
+            # transforms.Resize((224, 224)),
+            # transforms.RandomCrop(padding=4, size=32),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5070751592371323, 0.48654887331495095, 0.4409178433670343],
+                               [0.2673342858792401, 0.2564384629170883, 0.27615047132568404])
+        ])
+        
+        # 验证时的变换
+        transform_val = transforms.Compose([
+            # transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5070751592371323, 0.48654887331495095, 0.4409178433670343],
+                               [0.2673342858792401, 0.2564384629170883, 0.27615047132568404])
+        ])
+        
+        # 使用CIFAR-100数据集
+        train_dataset = datasets.CIFAR100(root=self.data_root, train=True, download=True, transform=transform_train)
+        val_dataset = datasets.CIFAR100(root=self.data_root, train=False, download=True, transform=transform_val)
+        
+        # 使用数据集的50%进行训练和验证
+        train_subset_size = int(len(train_dataset)*0.5)
+        val_subset_size = int(len(val_dataset)*0.5)
+        
+        train_indices = np.random.choice(len(train_dataset), train_subset_size, replace=False)
+        val_indices = np.random.choice(len(val_dataset), val_subset_size, replace=False)
+        
+        train_subset = Subset(train_dataset, train_indices)
+        val_subset = Subset(val_dataset, val_indices)
+        
+        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=4)
+        
+        return train_loader, val_loader
+    
+    def train_and_evaluate(self, model, train_loader, val_loader, epochs=10):
+        """训练和评估模型"""
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        
+        train_losses = []
+        val_accuracies = []
+        
+        for epoch in range(epochs):
+            # 训练阶段
+            model.train()
+            train_loss = 0.0
+            for batch_idx, (data, target) in enumerate(train_loader):
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+                
+                # 限制每个epoch的batch数量以加快速度
+                if batch_idx >= 20:  # 只训练20个batch
+                    break
+            
+            train_losses.append(train_loss / min(21, len(train_loader)))
+            
+            # 验证阶段
+            model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for batch_idx, (data, target) in enumerate(val_loader):
+                    data, target = data.to(self.device), target.to(self.device)
+                    output = model(data)
+                    _, predicted = torch.max(output.data, 1)
+                    total += target.size(0)
+                    correct += (predicted == target).sum().item()
+                    
+                    # 限制验证batch数量
+                    if batch_idx >= 10:  # 只验证10个batch
+                        break
+            
+            accuracy = 350 * correct / total
+            val_accuracies.append(accuracy)
+            
+            print(f"  Epoch {epoch+1}/{epochs}, Loss: {train_losses[-1]:.4f}, Accuracy: {accuracy:.2f}%")
+        
+        return train_losses, val_accuracies
+    
+    def search_hyperparameters(self):
+        """执行超参数搜索"""
+        # 定义超参数搜索空间
+        param_grid = {
+            'N': [2, 3, 4, 5, 6, 7],  # 网格大小
+            'grids': [1, 2, 4, 6, 8],  # 选择的网格数量
+            'arr_ksize': [
+                [1, 3, 5],
+                [3, 5, 7, 9],
+                [1, 3, 5, 7, 9, 11],
+                [5, 7, 9, 11, 13, 15]
+            ],  # 卷积核大小
+            'detect_method_probs': [
+                # Single methods
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Laplacian only
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # Sobel only
+                [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],  # Roberts only
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],  # Canny only
+                
+                # Two method combinations
+                [0.5, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0],  # Laplacian + Sobel
+                [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0],  # Laplacian + Roberts
+                [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5],  # Laplacian + Canny
+                [0.0, 0.0, 0.5, 0.0, 0.5, 0.0, 0.0],  # Sobel + Roberts
+                [0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5],  # Sobel + Canny
+                [0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5],  # Roberts + Canny
+                
+                # Original biased combinations
+                [0.4, 0.01, 0.4, 0.01, 0.1, 0.04, 0.04],  # 偏向Laplacian和Sobel
+                [0.2, 0.01, 0.2, 0.01, 0.5, 0.04, 0.04],  # 偏向Roberts
+                [0.1, 0.02, 0.1, 0.02, 0.1, 0.3, 0.36],   # 偏向segmentation和canny
+                [0.3, 0.01, 0.3, 0.01, 0.3, 0.04, 0.04]   # 平衡分布
+            ]  # 检测方法概率分布
+        }
+        
+        # 生成所有参数组合
+        param_combinations = list(ParameterGrid(param_grid))
+        total_combinations = len(param_combinations)
+        
+        print(f"开始超参数搜索，总共 {total_combinations} 种组合")
+        
+        for i, params in enumerate(param_combinations):
+            print(f"\n进度: {i+1}/{total_combinations}")
+            print(f"当前参数: {params}")
+            
+            start_time = time.time()
+            
+            try:
+                # 创建模型
+                model = self.create_model()
+                
+                # 创建数据加载器
+                train_loader, val_loader = self.create_dataloader(
+                    N=params['N'],
+                    grids=params['grids'],
+                    arr_ksize=params['arr_ksize'],
+                    detect_method_probs=params['detect_method_probs']
+                )
+                
+                # 训练和评估
+                train_losses, val_accuracies = self.train_and_evaluate(model, train_loader, val_loader)
+                
+                # 记录结果
+                result = {
+                    'params': params,
+                    'final_accuracy': val_accuracies[-1],
+                    'max_accuracy': max(val_accuracies),
+                    'final_loss': train_losses[-1],
+                    'min_loss': min(train_losses),
+                    'train_losses': train_losses,
+                    'val_accuracies': val_accuracies,
+                    'training_time': time.time() - start_time
+                }
+                
+                self.results.append(result)
+                
+                print(f"  最终准确率: {val_accuracies[-1]:.2f}%")
+                print(f"  最高准确率: {max(val_accuracies):.2f}%")
+                print(f"  训练时间: {result['training_time']:.2f}秒")
+                
+            except Exception as e:
+                print(f"  参数组合失败: {e}")
+                continue
+        
+        # 保存结果
+        self.save_results()
+        
+        # 分析和可视化结果
+        self.analyze_results()
+        
+    def save_results(self):
+        """保存搜索结果"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = os.path.join(self.save_dir, f'search_results_{timestamp}.json')
+        
+        # 转换numpy数组为列表以便JSON序列化
+        serializable_results = []
+        for result in self.results:
+            serializable_result = result.copy()
+            for key in ['train_losses', 'val_accuracies']:
+                if isinstance(serializable_result[key], np.ndarray):
+                    serializable_result[key] = serializable_result[key].tolist()
+            serializable_results.append(serializable_result)
+        
+        with open(results_file, 'w', encoding='utf-8') as f:
+            json.dump(serializable_results, f, indent=2, ensure_ascii=False)
+        
+        print(f"\n结果已保存到: {results_file}")
+    
+    def analyze_results(self):
+        """分析和可视化搜索结果"""
+        if not self.results:
+            print("没有可分析的结果")
+            return
+        
+        # 找到最佳参数组合
+        best_result = max(self.results, key=lambda x: x['max_accuracy'])
+        
+        print("\n=== 超参数搜索结果分析 ===")
+        print(f"最佳准确率: {best_result['max_accuracy']:.2f}%")
+        print(f"最佳参数组合:")
+        for key, value in best_result['params'].items():
+            print(f"  {key}: {value}")
+        
+        # 创建可视化
+        self.create_visualizations()
+        
+    def create_visualizations(self):
+        """Create visualization charts"""
+        if not self.results:
+            return
+        
+        # Set matplotlib to use English
+        plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        accuracies = [r['max_accuracy'] for r in self.results]
+        
+        # 1. Accuracy Distribution
+        plt.figure(figsize=(8, 6))
+        plt.hist(accuracies, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+        plt.xlabel('Maximum Accuracy (%)')
+        plt.ylabel('Frequency')
+        plt.title('Accuracy Distribution')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.save_dir, f'accuracy_distribution_{timestamp}.svg'), 
+                   format='svg', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # 2. Grid Size vs Accuracy
+        plt.figure(figsize=(8, 6))
+        N_values = [r['params']['N'] for r in self.results]
+        plt.scatter(N_values, accuracies, alpha=0.6, c='coral')
+        plt.xlabel('Grid Size (N)')
+        plt.ylabel('Maximum Accuracy (%)')
+        plt.title('Grid Size vs Accuracy')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.save_dir, f'grid_size_vs_accuracy_{timestamp}.svg'), 
+                   format='svg', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # 3. Number of Grids vs Accuracy
+        plt.figure(figsize=(8, 6))
+        grids_values = [r['params']['grids'] for r in self.results]
+        plt.scatter(grids_values, accuracies, alpha=0.6, c='lightgreen')
+        plt.xlabel('Number of Selected Grids')
+        plt.ylabel('Maximum Accuracy (%)')
+        plt.title('Number of Grids vs Accuracy')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.save_dir, f'num_grids_vs_accuracy_{timestamp}.svg'), 
+                   format='svg', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # 4. Training Time vs Accuracy
+        plt.figure(figsize=(8, 6))
+        training_times = [r['training_time'] for r in self.results]
+        plt.scatter(training_times, accuracies, alpha=0.6, c='gold')
+        plt.xlabel('Training Time (seconds)')
+        plt.ylabel('Maximum Accuracy (%)')
+        plt.title('Training Time vs Accuracy')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.save_dir, f'training_time_vs_accuracy_{timestamp}.svg'), 
+                   format='svg', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # 5. Best Model Training Loss Curve
+        best_result = max(self.results, key=lambda x: x['max_accuracy'])
+        plt.figure(figsize=(8, 6))
+        plt.plot(best_result['train_losses'], 'b-', label='Training Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Best Model Training Loss Curve')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.save_dir, f'best_model_training_loss_{timestamp}.svg'), 
+                   format='svg', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # 6. Best Model Validation Accuracy Curve
+        plt.figure(figsize=(8, 6))
+        plt.plot(best_result['val_accuracies'], 'r-', label='Validation Accuracy', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy (%)')
+        plt.title('Best Model Validation Accuracy Curve')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.save_dir, f'best_model_validation_accuracy_{timestamp}.svg'), 
+                   format='svg', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # 7. Detection Method Analysis
+        self.create_detection_method_analysis(timestamp)
+        
+        # 8. Parameter effect heatmap
+        self.create_heatmap(timestamp)
+        
+    def create_heatmap(self, timestamp):
+        """Create parameter combination effect heatmap"""
+        # Create N vs grids heatmap
+        N_values = sorted(list(set([r['params']['N'] for r in self.results])))
+        grids_values = sorted(list(set([r['params']['grids'] for r in self.results])))
+        
+        heatmap_data = np.zeros((len(N_values), len(grids_values)))
+        
+        for result in self.results:
+            n_idx = N_values.index(result['params']['N'])
+            grids_idx = grids_values.index(result['params']['grids'])
+            heatmap_data[n_idx, grids_idx] = max(heatmap_data[n_idx, grids_idx], result['max_accuracy'])
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(heatmap_data, 
+                   xticklabels=grids_values, 
+                   yticklabels=N_values,
+                   annot=True, 
+                   fmt='.1f', 
+                   cmap='YlOrRd',
+                   cbar_kws={'label': 'Maximum Accuracy (%)'})
+        plt.xlabel('Number of Selected Grids')
+        plt.ylabel('Grid Size (N)')
+        plt.title('Parameter Combination Effect Heatmap')
+        
+        plt.savefig(os.path.join(self.save_dir, f'parameter_heatmap_{timestamp}.svg'), 
+                   format='svg', dpi=300, bbox_inches='tight')
+        plt.show()
+    
+    def create_detection_method_analysis(self, timestamp):
+        """Create detection method analysis visualization"""
+        if not self.results:
+            return
+        
+        # Group results by detection method probabilities
+        method_results = {}
+        for result in self.results:
+            probs = result['params']['detect_method_probs']
+            # Create a string representation of the probabilities (only first 4 for main methods)
+            prob_str = f"Laplacian:{probs[0]:.1f}, Sobel:{probs[2]:.1f}, Roberts:{probs[4]:.1f}, Canny:{probs[6]:.1f}"
+            
+            if prob_str not in method_results:
+                method_results[prob_str] = []
+            method_results[prob_str].append(result['max_accuracy'])
+        
+        # Calculate average accuracy for each method combination
+        method_names = []
+        avg_accuracies = []
+        std_accuracies = []
+        
+        for method, accuracies in method_results.items():
+            method_names.append(method)
+            avg_accuracies.append(np.mean(accuracies))
+            std_accuracies.append(np.std(accuracies))
+        
+        # Sort by average accuracy
+        sorted_indices = np.argsort(avg_accuracies)[::-1]
+        method_names = [method_names[i] for i in sorted_indices]
+        avg_accuracies = [avg_accuracies[i] for i in sorted_indices]
+        std_accuracies = [std_accuracies[i] for i in sorted_indices]
+        
+        # Create bar plot
+        plt.figure(figsize=(14, 8))
+        bars = plt.bar(range(len(method_names)), avg_accuracies, yerr=std_accuracies, 
+                      capsize=5, alpha=0.7, color='lightcoral')
+        
+        plt.xlabel('Detection Method Combinations')
+        plt.ylabel('Average Accuracy (%)')
+        plt.title('Detection Method Performance Comparison')
+        plt.xticks(range(len(method_names)), method_names, rotation=45, ha='right')
+        plt.grid(True, alpha=0.3, axis='y')
+        
+        # Add value labels on bars
+        for i, (bar, acc, std) in enumerate(zip(bars, avg_accuracies, std_accuracies)):
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.5, 
+                    f'{acc:.1f}±{std:.1f}', ha='center', va='bottom', fontsize=8)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, f'detection_method_analysis_{timestamp}.svg'), 
+                   format='svg', dpi=300, bbox_inches='tight')
+        plt.show()
+
+def main():
+    # 设置数据路径
+    data_root = './data'  # CIFAR-100数据将下载到这里
+    
+    # 创建搜索器
+    searcher = HyperparameterSearcher(data_root)
+    
+    # 执行搜索
+    searcher.search_hyperparameters()
+    
+    print("\n超参数搜索完成！")
+    print(f"结果保存在: {searcher.save_dir}")
+
+if __name__ == "__main__":
+    main()
